@@ -1,141 +1,93 @@
-"""Leave-one-subject-out (LOSO) cross-validation over the OhioT1DM cohort."""
-from typing import List
+import copy
+from typing import Dict, List, Sequence as Seq
 
 import numpy as np
-import pandas as pd
-import torch
 
-from .config import SIGNALS, SIGNALS_FOR_LOSS, Config
-from .dataset import FinetuneBatcher, PretrainBatcher
-from .model import DecoderTransformer
-from .preprocessing import gen_finetuning_data, get_data, preprocess_data
-from .training import estimate_loss, estimate_loss_bolus_head, finetune, pretrain, weighted_persistence_mse_masked
+from .baselines import run_baselines
+from .config import Config
+from .metrics import alarm_metrics, choose_threshold, ranking_metrics
+from .model import CausalTransformer
+from .preprocessing import fit_norm_stats, load_sequence, normalize
+from .training import (DEVICE, bolus_probs, finetune, pooled_forecast_mse, pooled_persistence_mse,
+                       pretrain, set_seed)
+
+METHODS = ("transformer", "transformer_nopretrain", "gbm", "time_of_day")
 
 
-def run_fold(held_out_subject: int, all_subjects: List[int], config: Config = Config(),
-             data_dir: str = "bolus_data", verbose: bool = True):
-    """Trains and evaluates one LOSO fold: pretrains on every subject but
-    `held_out_subject`, then fine-tunes and evaluates bolus-timing classification
-    on the held-out subject. Returns (result_dict, loss_histories)."""
-    subject_ids = [s for s in all_subjects if s != held_out_subject]
-    subject_ids_test = [held_out_subject]
+def _recordings(seqs, probs_list, config: Config) -> List[dict]:
+    off = config.eval_offset
+    return [{"probs": p, "minutes": s.minutes[off:], "bolus_minutes": s.bolus_minutes}
+            for s, p in zip(seqs, probs_list)]
 
+
+def _score(method, val_seqs, val_probs, test_seqs, test_probs, config: Config) -> dict:
+    off = config.eval_offset
+    labels = np.concatenate([s.labels[off:] for s in test_seqs])
+    probs = np.concatenate(test_probs)
+    auroc, ap = ranking_metrics(probs, labels)
+    window = config.label_window_minutes
+    thr = choose_threshold(_recordings(val_seqs, val_probs, config), window, config.target_false_alarms_per_day)
+    return {"method": method, "test_auroc": auroc, "test_ap": ap, "base_rate": float(labels.mean()),
+            **alarm_metrics(_recordings(test_seqs, test_probs, config), window, thr)}
+
+
+def run_fold(test_subject: int, val_subject: int, train_subjects: Seq[int], config: Config, seed: int,
+             data_dir: str, test_splits: Seq[str] = ("training", "testing"),
+             methods: Seq[str] = METHODS, verbose: bool = True) -> List[dict]:
     if verbose:
-        print(f"\n=== Fold: holding out subject {held_out_subject} ===")
-        print(f"training on {subject_ids}")
+        print(f"\n=== test {test_subject} | val {val_subject} | train {list(train_subjects)} | seed {seed} ===")
+    set_seed(seed)
 
-    # --- load + align pretraining data, then fit normalization on the training subjects only ---
-    training_concat = np.array([])
-    subject_dfs = {}
+    train_seqs = [load_sequence(s, "training", config, data_dir) for s in train_subjects]
+    val_seqs = [load_sequence(val_subject, "training", config, data_dir)]
+    test_seqs = [load_sequence(test_subject, sp, config, data_dir) for sp in test_splits]
 
-    for subject_num in subject_ids + subject_ids_test:
-        x, _, mask = get_data(subject_num, "training", config.iob_peak, config.iob_dia, data_dir)
-        subject_dfs[subject_num] = (x, mask)
-        if subject_num in subject_ids:
-            chunk = subject_dfs[subject_num][0][SIGNALS].to_numpy()
-            training_concat = chunk if training_concat.shape[0] == 0 else np.concatenate((training_concat, chunk))
+    stats = fit_norm_stats(train_seqs)
+    train_arr = {s.key: normalize(s, stats) for s in train_seqs}
+    val_arr = [normalize(s, stats) for s in val_seqs]
+    test_arr = [normalize(s, stats) for s in test_seqs]
 
-    means, stds = {}, {}
-    for index, signal in enumerate(SIGNALS[:-2]):
-        means[signal] = np.nanmean(training_concat[:, index])
-        stds[signal] = np.nanstd(training_concat[:, index])
+    probs: Dict[str, Dict[str, List[np.ndarray]]] = {}
+    extra: Dict[str, dict] = {}
 
-    training_d, testing_d = {}, {}
-    for subject_num in subject_ids + subject_ids_test:
-        x_df, mask = subject_dfs[subject_num]
-        x_p, y_p = preprocess_data(x_df, SIGNALS, means, stds)
-        data = (
-            x_p[SIGNALS].to_numpy().astype(np.float32),
-            y_p.to_numpy().astype(np.float32),
-            mask,
-        )
-        if subject_num in subject_ids:
-            training_d[subject_num] = data
-        else:
-            testing_d[subject_num] = data
+    variants = []
+    if "transformer" in methods:
+        model, _ = pretrain(CausalTransformer(config).to(DEVICE), train_arr, val_arr, config, verbose)
+        extra["transformer"] = {
+            "pretrain_test_mse": pooled_forecast_mse(model, test_arr, config),
+            "persistence_test_mse": pooled_persistence_mse(test_arr, config),
+        }
+        variants.append(("transformer", copy.deepcopy(model)))
+    if "transformer_nopretrain" in methods:
+        variants.append(("transformer_nopretrain", CausalTransformer(config).to(DEVICE)))
+    for name, m in variants:
+        m, _ = finetune(m, train_arr, val_arr, config, verbose)
+        probs[name] = {"val": [bolus_probs(m, a, config) for a in val_arr],
+                       "test": [bolus_probs(m, a, config) for a in test_arr]}
 
-    weights = config.weights_tensor()
-    persistence_baseline = weighted_persistence_mse_masked(
-        testing_d[held_out_subject][1], testing_d[held_out_subject][2], weights, horizon=config.horizon
-    )
-    if verbose:
-        print(f"30-min weighted persistence baseline ({held_out_subject}): {persistence_baseline:.4f}")
+    probs.update(run_baselines(train_seqs, {"val": val_seqs, "test": test_seqs}, config, seed, methods))
 
-    # --- pretraining ---
-    pretrain_batcher = PretrainBatcher(training_d, testing_d, config.context_length, config.horizon)
-    model = DecoderTransformer(config, n_signals_for_loss=len(SIGNALS_FOR_LOSS))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.pretrain_lr)
-    model, pt_train_arr, pt_test_arr = pretrain(
-        model, optimizer, pretrain_batcher, config.batch_size, epochs=config.pretrain_epochs,
-        show_every=500 if verbose else config.pretrain_epochs + 1, verbose=verbose,
-    )
-    pretrain_test_loss = estimate_loss(model, pretrain_batcher, config.batch_size, "test")
-    pretrain_train_loss = estimate_loss(model, pretrain_batcher, config.batch_size, "train")
-
-    # --- fine-tuning data ---
-    bolus_train, bolus_test = gen_finetuning_data(
-        subject_ids, subject_ids_test, means, stds, config.iob_peak, config.iob_dia,
-        config.finetune_label_window, data_dir,
-    )
-    finetune_batcher = FinetuneBatcher(bolus_train, bolus_test, config.context_length)
-
-    all_train_labels = np.concatenate([bolus_train[s][1] for s in subject_ids])
-    num_pos = all_train_labels.sum()
-    num_neg = len(all_train_labels) - num_pos
-    pos_weight = torch.tensor([num_neg / num_pos])
-    if verbose:
-        print(f"positive rate: {num_pos / len(all_train_labels):.4f}, pos_weight: {pos_weight.item():.2f}")
-
-    # --- fine-tuning: start from the pretrained encoder weights ---
-    finetune_model = DecoderTransformer(config, n_signals_for_loss=len(SIGNALS_FOR_LOSS))
-    finetune_model.load_state_dict(model.state_dict(), strict=False)
-    optimizer_full = torch.optim.AdamW(finetune_model.parameters(), lr=config.finetune_lr)
-
-    finetune_model, ft_train_arr, ft_test_arr = finetune(
-        finetune_model, optimizer_full, finetune_batcher, config.batch_size, pos_weight,
-        epochs=config.finetune_epochs, show_every=200 if verbose else config.finetune_epochs + 1, verbose=verbose,
-    )
-
-    final_test_loss, final_test_auroc, final_test_ap = estimate_loss_bolus_head(
-        finetune_model, finetune_batcher, config.batch_size, "test", pos_weight
-    )
-    final_train_loss, final_train_auroc, final_train_ap = estimate_loss_bolus_head(
-        finetune_model, finetune_batcher, config.batch_size, "train", pos_weight
-    )
-
-    result = {
-        "held_out": held_out_subject,
-        "persistence_mse": persistence_baseline,
-        "pretrain_test_mse": pretrain_test_loss,
-        "train_auroc": final_train_auroc, "train_ap": final_train_ap,
-        "test_auroc": final_test_auroc, "test_ap": final_test_ap,
-        "finetune_test_loss": final_test_loss, "finetune_train_loss": final_train_loss,
-        "pretrain_test_loss": pretrain_test_loss, "pretrain_train_loss": pretrain_train_loss,
-    }
-    if verbose:
-        print(f"\n\nFOLD RESULT (held out {held_out_subject}): \n"
-              f"pretrain_test_mse={pretrain_test_loss:.4f} (persistence={persistence_baseline:.4f}), "
-              f"test_auroc={final_test_auroc:.4f}, test_ap={final_test_ap:.4f},\n"
-              f"finetune_test_loss={final_test_loss:.4f}, final_train_loss={final_train_loss:.4f}\n"
-              f"pretrain_test_loss={pretrain_test_loss:.4f}, pretrain_train_loss={pretrain_train_loss:.4f}")
-
-    histories = {
-        "pretrain_train": pt_train_arr, "pretrain_test": pt_test_arr,
-        "finetune_train": ft_train_arr, "finetune_test": ft_test_arr,
-    }
-    return result, histories
+    results = []
+    for method in methods:
+        r = _score(method, val_seqs, probs[method]["val"], test_seqs, probs[method]["test"], config)
+        r.update({"test_subject": test_subject, "val_subject": val_subject, "seed": seed, **extra.get(method, {})})
+        results.append(r)
+        if verbose:
+            print(f"  {method:24s} AUROC {r['test_auroc']:.3f}  AP {r['test_ap']:.3f}  "
+                  f"recall@{config.target_false_alarms_per_day:g}FA/day {r['recall_at_fa']:.2f} "
+                  f"(actual {r['fa_per_day']:.1f} FA/day)")
+    return results
 
 
-def run_loso_sweep(all_subjects: List[int], config: Config = Config(),
-                    data_dir: str = "bolus_data", verbose: bool = True):
-    """Runs one LOSO fold per subject. Returns (results_df, last_fold_histories)."""
-    loso_results = []
-    last_fold_histories = None
-
-    for held_out in all_subjects:
-        result, histories = run_fold(held_out, all_subjects, config, data_dir, verbose)
-        loso_results.append(result)
-        last_fold_histories = histories
-
-    results_df = pd.DataFrame(loso_results)
-    return results_df, last_fold_histories
+def run_loso(subjects: Seq[int], config: Config, seeds: Seq[int], data_dir: str,
+             test_splits: Seq[str] = ("training", "testing"), methods: Seq[str] = METHODS,
+             verbose: bool = True) -> List[dict]:
+    subjects = list(subjects)
+    results = []
+    for i, test_subject in enumerate(subjects):
+        val_subject = subjects[(i + 1) % len(subjects)]
+        train_subjects = [s for s in subjects if s not in (test_subject, val_subject)]
+        for seed in seeds:
+            results += run_fold(test_subject, val_subject, train_subjects, config, seed,
+                                data_dir, test_splits, methods, verbose)
+    return results
