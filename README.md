@@ -6,28 +6,6 @@ The main model is a small causal transformer. It's first pretrained to forecast 
 
 The prediction target, at every 5-minute CGM reading t, is whether a bolus gets logged in (t, t + 20 min]. These labels come from what patients actually logged, so they reflect behavior rather than when a bolus would have been medically ideal.
 
-## Results
-
-Leave-one-subject-out over the 6 subjects, 3 seeds each (18 runs per method), mean ± std. About 6.7% of timesteps are positive.
-
-| Method | AUROC | AP | Bolus recall | False alarms/day | Median lead (min) |
-|---|---|---|---|---|---|
-| Transformer (pretrained) | 0.677 ± 0.042 | 0.118 ± 0.037 | 0.140 ± 0.112 | 6.2 ± 5.5 | 10 ± 2 |
-| Transformer (no pretraining) | 0.681 ± 0.040 | 0.118 ± 0.030 | 0.139 ± 0.092 | 5.8 ± 3.8 | 10 ± 2 |
-| Gradient-boosted trees | 0.692 ± 0.038 | 0.133 ± 0.036 | 0.165 ± 0.104 | 4.8 ± 3.2 | 10 ± 2 |
-| Time of day only | 0.590 ± 0.015 | 0.085 ± 0.023 | 0.021 ± 0.015 | 1.0 ± 0.1 | 13 ± 3 |
-
-Recall and false alarms use a threshold picked on the validation subject to allow at most 4 false alarms per day (see Evaluation).
-
-![Per-subject test AUROC](figures/per_subject_auroc.png)
-
-What I take from this:
-
-- **Physiology helps beyond meal times.** Every model beats the time-of-day baseline on every subject, by roughly 0.1 AUROC. Glucose trends and insulin on board carry real information about upcoming boluses.
-- **The transformer doesn't beat gradient-boosted trees.** Subject by subject, the trees win clearly on 559 and 588 and tie on the rest. With 6 subjects and meals unobserved, a few good tabular features capture most of the available signal.
-- **Pretraining doesn't help classification.** The pretrained encoder forecasts 30 minutes ahead 12% better than persistence (weighted MSE 0.335 vs 0.382), but fine-tuning from it scores the same as training from scratch.
-- **Alarm thresholds don't transfer well between people.** A threshold tuned for 4 false alarms/day on one subject gave anywhere from 1 to 18 on another. Calibrating on a new patient's first few days of data looks like the most useful next step.
-
 ## How it works
 
 ### Data
