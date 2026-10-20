@@ -1,63 +1,71 @@
-"""CLI entry point: runs the full LOSO cross-validation sweep and reports/plots results.
-
-Usage:
-    python main.py --data-dir bolus_data --subjects 563 559 570 575 588 591
-"""
 import argparse
+import dataclasses
+import os
+from typing import List, Optional
 
-import matplotlib.pyplot as plt
+import pandas as pd
 
 from bolus_transformer.config import Config
-from bolus_transformer.loso import run_loso_sweep
+from bolus_transformer.loso import METHODS, run_loso
 
-# 2018 cohort (Basis sensor band) -- the six subjects used in the reported LOSO results.
-DEFAULT_SUBJECTS = [563, 559, 570, 575, 588, 591]
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Run LOSO cross-validation for the bolus-timing transformer.")
-    parser.add_argument("--data-dir", default="bolus_data", help="Directory containing the OhioT1DM XML files.")
-    parser.add_argument("--subjects", type=int, nargs="+", default=DEFAULT_SUBJECTS,
-                         help="Subject IDs to include in the LOSO sweep.")
-    parser.add_argument("--plot-out", default=None,
-                         help="If set, save the last fold's training curves here instead of showing them.")
-    parser.add_argument("--quiet", action="store_true", help="Suppress per-step training logs.")
-    return parser.parse_args()
+DEFAULT_SUBJECTS = [559, 563, 570, 575, 588, 591]
+SUMMARY_COLS = ["test_auroc", "test_ap", "recall_at_fa", "fa_per_day", "median_lead_min"]
 
 
-def plot_histories(histories: dict, out_path: str = None):
-    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
-    axes[0, 0].plot(histories["pretrain_train"]); axes[0, 0].set_title("pretrain train loss")
-    axes[0, 1].plot(histories["pretrain_test"]); axes[0, 1].set_title("pretrain test loss")
-    axes[1, 0].plot(histories["finetune_train"]); axes[1, 0].set_title("finetune train loss")
-    axes[1, 1].plot(histories["finetune_test"]); axes[1, 1].set_title("finetune test loss")
-    plt.tight_layout()
-    if out_path:
-        plt.savefig(out_path)
-        print(f"Saved training curves to {out_path}")
-    else:
-        plt.show()
+def parse_args(argv: Optional[List[str]] = None):
+    p = argparse.ArgumentParser(description="Leave-one-subject-out evaluation for bolus timing.")
+    p.add_argument("--data-dir", default="bolus_data")
+    p.add_argument("--subjects", type=int, nargs="+", default=DEFAULT_SUBJECTS)
+    p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    p.add_argument("--methods", nargs="+", default=list(METHODS), choices=METHODS)
+    p.add_argument("--test-splits", nargs="+", default=["training", "testing"])
+    p.add_argument("--out-dir", default="results")
+    p.add_argument("--quick", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    return p.parse_args(argv)
 
 
-def main():
-    args = parse_args()
-    config = Config()
+def quick_config(config: Config) -> Config:
+    return dataclasses.replace(config, pretrain_steps=60, finetune_steps=60, eval_every=20, patience=3)
 
-    results_df, last_fold_histories = run_loso_sweep(
-        args.subjects, config=config, data_dir=args.data_dir, verbose=not args.quiet
-    )
 
-    print()
-    print(results_df)
-    print("Means:\n")
-    print(results_df[[
-        "pretrain_test_mse", "test_auroc", "test_ap",
-        "pretrain_train_loss", "pretrain_test_loss",
-        "finetune_train_loss", "finetune_test_loss",
-    ]].agg(["mean", "std"]))
+def summarize(df: pd.DataFrame, config: Config) -> str:
+    fa = f"{config.target_false_alarms_per_day:g}"
+    headers = ["Method", "AUROC", "AP", f"Bolus recall @ ≤{fa} FA/day", "Actual FA/day", "Median lead (min)"]
+    lines = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
+    for method, g in df.groupby("method", sort=False):
+        cells = [f"{g[c].mean():.3f} ± {g[c].std(ddof=0):.3f}" if c != "median_lead_min"
+                 else f"{g[c].mean():.0f} ± {g[c].std(ddof=0):.0f}" for c in SUMMARY_COLS]
+        lines.append(f"| {method} | " + " | ".join(cells) + " |")
 
-    if last_fold_histories is not None:
-        plot_histories(last_fold_histories, args.plot_out)
+    out = "\n".join(lines)
+    out += f"\n\nBase rate (positive rows): {df['base_rate'].mean():.3f}. "
+    out += f"Runs per method: {df.groupby('method').size().iloc[0]} (folds × seeds).\n"
+    if "pretrain_test_mse" in df:
+        t = df.dropna(subset=["pretrain_test_mse"])
+        if len(t):
+            gain = 1 - t["pretrain_test_mse"] / t["persistence_test_mse"]
+            out += (f"\nPretraining (30-min forecast, held-out subject): weighted MSE "
+                    f"{t['pretrain_test_mse'].mean():.4f} vs persistence {t['persistence_test_mse'].mean():.4f} "
+                    f"({gain.mean():.1%} ± {gain.std(ddof=0):.1%} lower).\n")
+    return out
+
+
+def main(argv: Optional[List[str]] = None):
+    args = parse_args(argv)
+    config = quick_config(Config()) if args.quick else Config()
+
+    results = run_loso(args.subjects, config, args.seeds, args.data_dir,
+                       args.test_splits, args.methods, verbose=not args.quiet)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    df = pd.DataFrame(results)
+    df.to_csv(os.path.join(args.out_dir, "results.csv"), index=False)
+    summary = summarize(df, config)
+    with open(os.path.join(args.out_dir, "summary.md"), "w") as f:
+        f.write(summary)
+    print("\n" + summary)
+    return df
 
 
 if __name__ == "__main__":

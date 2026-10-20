@@ -1,67 +1,52 @@
-"""Random-window batch samplers for pretraining and fine-tuning.
+from typing import Dict, List, Tuple
 
-These replace the notebook's module-level globals (`training_d`, `testing_d`,
-`bolus_train`, `bolus_test`) with small stateful objects so a fold's data doesn't
-leak into the next one.
-"""
-from typing import Dict, Tuple
-
+import numpy as np
 import torch
 
 
-class PretrainBatcher:
-    """Samples (context, target, mask) windows for the next-timestep pretraining
-    objective. Each of `train_data`/`test_data` maps subject_id -> (features,
-    targets, mask) numpy arrays, all sharing the same length per subject."""
-
-    def __init__(self, train_data: Dict, test_data: Dict, context_length: int, horizon: int):
-        self.train_data = train_data
-        self.test_data = test_data
+class WindowSampler:
+    def __init__(self, arrays: Dict[str, Dict[str, np.ndarray]], context_length: int, horizon: int = 0):
         self.context_length = context_length
         self.horizon = horizon
+        need = context_length + horizon + 1
+        self.arrays = [a for a in arrays.values() if len(a["x"]) >= need]
+        if not self.arrays:
+            raise ValueError("No sequence is long enough for one training window.")
 
-    def _data_for(self, split: str) -> Dict:
-        return self.train_data if split == "train" else self.test_data
+    def _starts(self, batch_size: int) -> List[Tuple[dict, int]]:
+        picks = torch.randint(len(self.arrays), (batch_size,)).tolist()
+        out = []
+        for p in picks:
+            a = self.arrays[p]
+            hi = len(a["x"]) - self.context_length - self.horizon
+            out.append((a, torch.randint(hi, (1,)).item()))
+        return out
 
-    def get_batch(self, batch_size: int, split: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        data_lib = self._data_for(split)
-        key_list = list(data_lib.keys())
-        subject_idx = torch.randint(len(data_lib), (batch_size,))
+    def pretrain_batch(self, batch_size: int):
         c, h = self.context_length, self.horizon
-        ids = [
-            (key_list[i], torch.randint(len(data_lib[key_list[i]][0]) - c - h, (1,)).item())
-            for i in subject_idx
-        ]
+        starts = self._starts(batch_size)
+        x = np.stack([a["x"][i:i + c] for a, i in starts])
+        y = np.stack([a["y"][i + h:i + c + h] for a, i in starts])
+        m = np.stack([a["mask"][i + h:i + c + h] for a, i in starts])
+        return torch.from_numpy(x), torch.from_numpy(y), torch.from_numpy(m)
 
-        bx = torch.stack([torch.from_numpy(data_lib[sid][0][i:i + c]) for sid, i in ids])
-        by = torch.stack([torch.from_numpy(data_lib[sid][1][i + h:i + c + h]) for sid, i in ids])
-        bm = torch.stack([torch.from_numpy(data_lib[sid][2][i + h:i + c + h]) for sid, i in ids])
-        return bx, by, bm
-
-
-class FinetuneBatcher:
-    """Samples (context, bolus-label) windows for the fine-tuning classification
-    head. Each of `train_data`/`test_data` maps subject_id -> (features,
-    bolus_labels) numpy arrays."""
-
-    def __init__(self, train_data: Dict, test_data: Dict, context_length: int):
-        self.train_data = train_data
-        self.test_data = test_data
-        self.context_length = context_length
-
-    def _data_for(self, split: str) -> Dict:
-        return self.train_data if split == "train" else self.test_data
-
-    def get_batch(self, batch_size: int, split: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        data_lib = self._data_for(split)
-        key_list = list(data_lib.keys())
-        subject_idx = torch.randint(len(data_lib), (batch_size,))
+    def finetune_batch(self, batch_size: int):
         c = self.context_length
-        ids = [
-            (key_list[i], torch.randint(len(data_lib[key_list[i]][0]) - c, (1,)).item())
-            for i in subject_idx
-        ]
+        starts = self._starts(batch_size)
+        x = np.stack([a["x"][i:i + c] for a, i in starts])
+        y = np.stack([a["labels"][i:i + c] for a, i in starts])
+        return torch.from_numpy(x), torch.from_numpy(y)
 
-        bx = torch.stack([torch.from_numpy(data_lib[sid][0][i:i + c]) for sid, i in ids])
-        by = torch.stack([torch.from_numpy(data_lib[sid][1][i:i + c]) for sid, i in ids])
-        return bx, by.unsqueeze(-1)
+
+def sweep_windows(n: int, context_length: int, offset: int) -> List[Tuple[int, int]]:
+    c = context_length
+    if n < c:
+        return []
+    starts = list(range(0, n - c + 1, c - offset))
+    if starts[-1] + c < n:
+        starts.append(n - c)
+    windows, covered = [], offset
+    for s in starts:
+        windows.append((s, max(offset, covered - s)))
+        covered = s + c
+    return windows
