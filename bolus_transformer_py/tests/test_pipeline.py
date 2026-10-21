@@ -59,6 +59,28 @@ def test_normalization_fits_after_log_transform(data_dir):
     assert (pooled["basis_gsr"].std() > 0.8) and (pooled["basis_gsr"].std() < 1.05)
 
 
+def test_missing_inputs_use_learned_embedding():
+    import torch
+    from bolus_transformer.model import CausalTransformer
+    torch.manual_seed(0)
+    model = CausalTransformer(CONFIG).eval()
+    x = torch.randn(2, CONFIG.context_length, len(SIGNALS))
+    x_missing, x_zero = x.clone(), x.clone()
+    x_missing[:, 20, 1] = float("nan")
+    x_zero[:, 20, 1] = 0.0
+
+    with torch.no_grad():
+        out_missing, out_zero = model(x_missing), model(x_zero)
+    assert torch.isfinite(out_missing).all()
+    assert not torch.allclose(out_missing[:, 20:], out_zero[:, 20:])
+    assert torch.allclose(out_missing[:, :20], out_zero[:, :20], atol=1e-6)
+
+    model.train()
+    model.bolus_logits(x_missing).sum().backward()
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    assert model.missing_embeddings.grad[1].abs().sum() > 0
+
+
 def test_alarm_metric_does_not_reward_staying_high():
     minutes = np.arange(0, 300, 5.0)
     boluses = np.array([100.0, 200.0])

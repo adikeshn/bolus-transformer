@@ -57,10 +57,9 @@ def normalize(seq: Sequence, stats: Tuple[pd.Series, pd.Series]) -> Dict[str, np
     means, stds = stats
     df = seq.features.copy()
     df[NORMALIZED_SIGNALS] = (df[NORMALIZED_SIGNALS] - means) / stds
-    df = df.fillna(0.0)
     return {
         "x": df[SIGNALS].to_numpy(dtype=np.float32),
-        "y": df[SIGNALS_FOR_LOSS].to_numpy(dtype=np.float32),
+        "y": df[SIGNALS_FOR_LOSS].fillna(0.0).to_numpy(dtype=np.float32),
         "mask": seq.mask,
         "labels": seq.labels,
     }

@@ -18,7 +18,7 @@ The 2018 OhioT1DM cohort (subjects 559, 563, 570, 575, 588, 591, recorded with t
 - carbs entered with each bolus
 - time of day, encoded as sin and cos so 23:55 and 00:00 end up close together
 
-Wearable readings are matched to CGM timestamps with a backward as-of merge (2.5 min tolerance), so a row never takes a reading from the future. Each recording is trimmed to the span where all wearables have data. GSR and carbs are log-transformed, then everything is z-scored using statistics from the training subjects only.
+Wearable readings are matched to CGM timestamps with a backward as-of merge (2.5 min tolerance), so a row never takes a reading from the future. Each recording is trimmed to the span where all wearables have data. GSR and carbs are log-transformed, then everything is z-scored using statistics from the training subjects only. Missing wearable readings stay missing rather than being filled in (see Model).
 
 ### No look-ahead
 
@@ -27,6 +27,7 @@ Features at time t only use boluses logged at or before t, and the label at t on
 ### Model
 
 - Each signal gets its own linear embedding. The embeddings are concatenated and projected to one 32-dim token per timestep, plus a learned position embedding.
+- When a wearable reading is missing, its slot gets a learned per-signal "missing" vector instead of an embedded value. That way the model can tell a gap apart from an average reading, and can learn from the gap itself (for example, the watch being off).
 - 3 transformer encoder blocks (4 heads) with a causal mask, so each position only attends to the past. The context is 36 tokens, which is 3 hours.
 - **Pretraining:** a linear head predicts each sensor 30 minutes ahead. The loss is masked MSE, so missing readings aren't penalized, and glucose is weighted 4x.
 - **Fine-tuning:** a small MLP head outputs a bolus logit at every position. It's trained with BCE, with positives weighted by the negative/positive ratio (about 14x).
